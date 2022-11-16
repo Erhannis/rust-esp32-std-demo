@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Condvar, Mutex};
 use std::{cell::RefCell, env, sync::atomic::*, sync::Arc, thread, time::*};
 
+use crossbeam_channel::{bounded, Sender};
+
 use anyhow::bail;
 
 use embedded_svc::mqtt::client::utils::ConnState;
@@ -93,6 +95,8 @@ fn main() -> Result<()> {
     test_threads();
 
     test_fs()?;
+
+    test_csp()?;
 
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -287,6 +291,43 @@ fn test_fs() -> Result<()> {
         PathBuf::from("/foo/baz")
     );
 
+    Ok(())
+}
+
+/// Hmmmm.  This failed twice, blocking on (once presumably and the other confirmedly) the receive,
+/// but has now succeeded many times in a row, with no functional change being made to the code.
+/// This fills me with discomfort, but I guess I'll pretend it's working and correct and everything
+/// until something goes wrong again.  ...  <_<b
+/// WAIT.  I forgot I accidentally set channel size from 0 to 3.
+/// ...Yup, changing it back to 0 broke it again.  ...With whom do I file a bug report?
+fn test_csp() -> Result<()> {
+    println!("--> test_csp");
+
+    fn fibonacci(sender: Sender<u64>) {
+        println!("--> test_csp.fibonacci");
+        let (mut x, mut y) = (0, 1);
+        while sender.send(x).is_ok() {
+            println!("--- test_csp.fibonacci loop {x} {y}");
+            let tmp = x;
+            x = y;
+            y += tmp;
+        }
+        println!("<-- test_csp.fibonacci");
+    }
+
+    println!("--- test_csp 1");
+    let (s, r) = bounded(0);
+    println!("--- test_csp 2");
+    thread::spawn(|| fibonacci(s));
+    println!("--- test_csp 3");
+
+    // Print the first 20 Fibonacci numbers.
+    for num in r.iter().take(20) {
+        println!("{}", num);
+    }
+    println!("--- test_csp 4");
+
+    println!("<-- test_csp 5");
     Ok(())
 }
 
