@@ -41,6 +41,7 @@ use smol;
 use embedded_hal::adc::OneShot;
 use embedded_hal::blocking::delay::DelayMs;
 use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::digital::v2::InputPin;
 
 use embedded_svc::eth;
 use embedded_svc::eth::{Eth, TransitionalState};
@@ -315,6 +316,9 @@ fn main() -> Result<()> {
         adc::config::Config::new().calibration(true),
     )?;
 
+    let mut led = pins.gpio2.into_output().unwrap();
+    let mut d32 = pins.gpio32.into_input().unwrap();
+
     #[allow(unused)]
     let cycles = loop {
         if let Some(cycles) = *wait {
@@ -335,6 +339,11 @@ fn main() -> Result<()> {
                 "A2 sensor reading: {}mV",
                 powered_adc1.read(&mut a2).unwrap()
             );
+            if d32.is_high()? {
+                led.set_high();
+            } else {
+                led.set_low();
+            }
         }
     };
 
