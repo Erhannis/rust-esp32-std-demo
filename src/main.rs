@@ -7,9 +7,11 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex};
-use std::{cell::RefCell, env, sync::atomic::*, sync::Arc, thread, time::*};
+use std::{cell::RefCell, env, sync::atomic::*, sync::Arc, thread, time::*, net::UdpSocket};
 
-use crossbeam_channel::{bounded, Sender};
+use rand::Rng;
+
+use crossbeam_channel::{select, bounded, Sender, Receiver};
 
 use anyhow::bail;
 
@@ -78,6 +80,8 @@ use st7789;
 
 use epd_waveshare::{epd4in2::*, graphics::VarDisplay, prelude::*};
 
+mod csp;
+
 const SSID: &str = env!("RUST_ESP32_STD_DEMO_WIFI_SSID");
 const PASS: &str = env!("RUST_ESP32_STD_DEMO_WIFI_PASS");
 
@@ -97,6 +101,8 @@ fn main() -> Result<()> {
     test_fs()?;
 
     test_csp()?;
+
+    //test_csp_heavy();
 
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -125,19 +131,21 @@ fn main() -> Result<()> {
 
     test_tcp_bind()?;
 
-    let _sntp = sntp::EspSntp::new_default()?;
-    info!("SNTP initialized");
+    test_broadcast();
 
-    let (eventloop, _subscription) = test_eventloop()?;
+    // let _sntp = sntp::EspSntp::new_default()?;
+    // info!("SNTP initialized");
 
-    let mqtt_client = test_mqtt_client()?;
+    // let (eventloop, _subscription) = test_eventloop()?;
 
-    let _timer = test_timer(eventloop, mqtt_client)?;
+    // let mqtt_client = test_mqtt_client()?;
 
-    #[cfg(feature = "experimental")]
-    experimental::test()?;
+    // let _timer = test_timer(eventloop, mqtt_client)?;
 
-    enable_napt(&mut wifi)?;
+    // #[cfg(feature = "experimental")]
+    // experimental::test()?;
+
+    // enable_napt(&mut wifi)?;
 
     let mutex = Arc::new((Mutex::new(None), Condvar::new()));
 
@@ -155,35 +163,124 @@ fn main() -> Result<()> {
         adc::config::Config::new().calibration(true),
     )?;
 
-    let mut led = pins.gpio2.into_output().unwrap();
-    let mut d32 = pins.gpio32.into_input().unwrap();
-
-    #[allow(unused)]
-    let cycles = loop {
-        if let Some(cycles) = *wait {
-            break cycles;
-        } else {
-            wait = mutex
-                .1
-                .wait_timeout(wait, Duration::from_secs(1))
-                .unwrap()
-                .0;
-
-            log::info!(
-                "Hall sensor reading: {}mV",
-                powered_adc1.read(&mut hall_sensor).unwrap()
-            );
-            log::info!(
-                "A2 sensor reading: {}mV",
-                powered_adc1.read(&mut a2).unwrap()
-            );
-            if d32.is_high()? {
-                led.set_high();
+    let (pin_hit_out, pin_hit_in) = bounded(1); //DUMMY Erroneously deadlocks if 0
+    let b_down = pins.gpio25.into_input().unwrap();
+    let b_up = pins.gpio33.into_input().unwrap();
+    let b_guess = pins.gpio32.into_input().unwrap();
+    thread::spawn(move || { // Pin manager
+        let mut state = [true,true,true];
+        loop {
+            sleep(50); //THINK Is this enough of a delay to catch btn presses?  Is there a built in event handler thing?
+            if b_down.is_high().unwrap() {
+                state[0] = true;
             } else {
-                led.set_low();
+                if state[0] {
+                    pin_hit_out.send(0);
+                }
+                state[0] = false;
+            }
+            if b_up.is_high().unwrap() {
+                state[1] = true;
+            } else {
+                if state[1] {
+                    pin_hit_out.send(1);
+                }
+                state[1] = false;
+            }
+            if b_guess.is_high().unwrap() {
+                state[2] = true;
+            } else {
+                if state[2] {
+                    pin_hit_out.send(2);
+                }
+                state[2] = false;
             }
         }
-    };
+    });
+
+    let (led_out, led_in) = bounded::<&[(bool, u64)]>(1); //DUMMY Erroneously deadlocks if 0
+    let mut led = pins.gpio2.into_output().unwrap();
+    //let b_led = pins.gpio26.into_input().unwrap();
+    thread::spawn(move || { // LED manager
+        let mut actions: Vec<(bool, u64)> = vec![];
+        loop {
+            println!("led: actions {actions:?}");
+            let (state, rt) = actions.pop().unwrap_or((false, 60000));
+            if state {
+                led.set_high().unwrap();
+            } else {
+                led.set_low().unwrap();
+            }
+            println!("led: timer {:?}", (state, rt));
+            let t = csp::timer(rt);
+            select! {
+                recv(led_in) -> msg => {
+                    let actions_in = msg.unwrap(); //DUMMY Really, I ought to be handling these errors
+                    println!("led: got actions {actions_in:?}");
+                    actions.clear();
+                    actions.append(&mut Vec::from(actions_in));
+                },
+                recv(t) -> msg => {
+                    println!("led: finished phase");
+                },
+            }
+        }
+    });
+
+    fn game(pin_hit_in: Receiver<i32>, led_out: Sender<&[(bool, u64)]>) {
+        let secret: u64 = rand::thread_rng().gen_range(1..=10);
+        println!("secret: {secret}");
+        let mut cur: u64 = 1;
+        loop {
+            let btn = pin_hit_in.recv().unwrap();
+            println!("{btn}");
+            match btn {
+                0 => cur -= 1,
+                1 => cur += 1,
+                2 => {
+                    if cur == secret {
+                        println!("you win!");
+                        led_out.send(&[(true, 100),(false, 100),(true, 100),(false, 100),(true, 100),(false, 100),(true, 100),(false, 100),(true, 100),(false, 100),]);
+                    } else if cur < secret {
+                        led_out.send(&[(true, 1000)]);
+                    } else if secret < cur {
+                        led_out.send(&[(true, 100)]);
+                    }
+                },
+                _ => (),
+            }
+            println!("btn: {btn} ; cur: {cur} ; secret: {secret}");
+        }
+    }
+
+    game(pin_hit_in, led_out);
+
+    // #[allow(unused)]
+    // let cycles = loop {
+    //     if let Some(cycles) = *wait { //THINK I never did understand something about this mutex....
+    //         break cycles;
+    //     } else {
+    //         wait = mutex
+    //             .1
+    //             .wait_timeout(wait, Duration::from_secs(1))
+    //             .unwrap()
+    //             .0;
+
+    //         log::info!(
+    //             "Hall sensor reading: {}mV",
+    //             powered_adc1.read(&mut hall_sensor).unwrap()
+    //         );
+    //         log::info!(
+    //             "A2 sensor reading: {}mV",
+    //             powered_adc1.read(&mut a2).unwrap()
+    //         );
+    //         if d32.is_high()? {
+    //             led.set_high();
+    //         } else {
+    //             led.set_low();
+    //         }
+    //     }
+    // };
 
     for s in 0..3 {
         info!("Shutting down in {} secs", 3 - s);
@@ -308,6 +405,7 @@ fn test_csp() -> Result<()> {
         let (mut x, mut y) = (0, 1);
         while sender.send(x).is_ok() {
             println!("--- test_csp.fibonacci loop {x} {y}");
+            //thread::sleep(Duration::from_secs(1));
             let tmp = x;
             x = y;
             y += tmp;
@@ -316,7 +414,7 @@ fn test_csp() -> Result<()> {
     }
 
     println!("--- test_csp 1");
-    let (s, r) = bounded(0);
+    let (s, r) = bounded(1); //DUMMY Erroneously deadlocks if 0
     println!("--- test_csp 2");
     thread::spawn(|| fibonacci(s));
     println!("--- test_csp 3");
@@ -329,6 +427,83 @@ fn test_csp() -> Result<()> {
 
     println!("<-- test_csp 5");
     Ok(())
+}
+
+fn current_millis() -> u128 {
+    return EspSystemTime {}.now().as_millis();
+}
+
+fn test_csp_heavy() {
+    // let socket = UdpSocket::bind("0.0.0.0:0").expect("couldn't bind address");
+    // socket.set_broadcast(true).expect("failed to set broadcast");
+    // socket.send_to("asdf".as_bytes(), "255.255.255.255:3400").expect("couldn't send data");
+
+    println!("--> test_csp_heavy");
+
+    const MSGS: u64 = 1000;
+    const POLLERS: u64 = 10;
+
+    fn generator(s: Sender<String>) {
+        println!("--> test_csp_heavy.generator");
+        let mut rand = rand::thread_rng();
+        for _ in 0..(MSGS*POLLERS) {
+            let i = rand.gen::<f64>();
+            //println!("--- test_csp.generator send...");
+            s.send(format!("{i}")).unwrap();
+            //println!("--- ...test_csp.generator sent");
+        }
+        println!("<-- test_csp_heavy.generator");
+    }
+
+    fn poller(id: u64, r: Receiver<String>, s: Sender<String>) {
+        println!("--> test_csp_heavy.poller {id}");
+        let mut rand = rand::thread_rng();
+        let mut done = false;
+        for _ in 0..MSGS {
+            let x = r.recv().unwrap();
+            //sleep(rand.gen_range(500..=2000));
+            //println!("--- test_csp_heavy.poller {id} send...");
+            done = !s.send(x).is_ok();
+            //println!("--- ...test_csp_heavy.poller {id} sent");
+        }        
+        println!("<-- test_csp_heavy.poller {id}");
+    }
+
+    println!("--- test_csp_heavy 1");
+    let (sg, rg) = bounded(1);
+    let (s0, r0) = bounded(1);
+    // let (s1, r1) = bounded(0);
+    // let (s2, r2) = bounded(0);
+
+    println!("--- test_csp_heavy 2");
+    thread::spawn(|| generator(sg));
+
+    println!("--- test_csp_heavy 2.1");
+    for id in 0..POLLERS {
+        let s = s0.clone();
+        let r = rg.clone();
+        thread::spawn(move || poller(id, r, s)); //THINK Not sure why I suddenly needed `move`
+    }
+    println!("--- test_csp_heavy 3");
+
+    let mut rand = rand::thread_rng();
+
+    let start = current_millis();
+    let mut i = 0;
+    for _ in 0..(MSGS*POLLERS) {
+        //sleep(rand.gen_range(100..=1000));
+        select! {
+            recv(r0) -> msg => i = i+1,//println!("rx 0 {}", msg.unwrap()),
+            // recv(r1) -> msg => println!("rx 1 {}", msg.unwrap()),
+            // recv(r2) -> msg => println!("rx 2 {}", msg.unwrap()),
+        }
+    }
+    let end = current_millis();
+    println!("rx {i} msgs in {}ms", end-start);
+
+    println!("--- test_csp_heavy 4");
+
+    println!("<-- test_csp_heavy");
 }
 
 fn test_tcp() -> Result<()> {
@@ -355,6 +530,12 @@ fn test_tcp() -> Result<()> {
         std::str::from_utf8(&result)?);
 
     Ok(())
+}
+
+fn test_broadcast() {
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("couldn't bind address");
+    socket.set_broadcast(true).expect("failed to set broadcast");
+    socket.send_to("asdf".as_bytes(), "255.255.255.255:3400").expect("couldn't send data");
 }
 
 fn test_tcp_bind() -> Result<()> {
@@ -750,4 +931,11 @@ fn enable_napt(wifi: &mut EspWifi) -> Result<()> {
     info!("NAPT enabled on the WiFi SoftAP!");
 
     Ok(())
+}
+
+
+
+
+fn sleep(ms: u64) {
+    thread::sleep(Duration::from_millis(ms));
 }
